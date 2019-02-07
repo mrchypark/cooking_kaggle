@@ -1,0 +1,170 @@
+---
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(jsonlite)
+library(tidyverse)
+library(tidytext)
+library(text2vec)
+library(glmnet)
+library(gt)
+library(textstem)
+```
+
+## What's cooking?
+
+### 박찬엽
+
+음식 아이디 별로 제공된 음식의 재료(`ingredients`)로 종류(`cuisine`)를 맞추기
+
+### 데이터 불러오기
+
+```{r}
+cuis <- fromJSON("data/train.json") %>% 
+  as_tibble() %>% 
+  rename(ingre = ingredients) 
+
+cuis %>% 
+  unnest %>% 
+  head(10) %>% 
+  gt() %>% 
+  tab_options(
+    table.width = pct(100)
+  )
+```
+
+### 전처리
+
+띄어쓰기 단위 분리, 소문자화, 특수문자 제거 진행
+
+```{r}
+cuis_pre <- 
+  cuis %>% 
+  unnest() %>% 
+  # 띄어쓰기 단위 분리
+  unnest_tokens(word, ingre) %>% 
+  # 소문자 화
+  mutate(word = tolower(word)) %>% 
+  # 언더스코어로 통일
+  mutate(word = gsub("-", "_", word)) %>% 
+  # 특수문자 제거
+  mutate(word = gsub("[^a-z0-9_ ]", "", word)) %>% 
+  # 원문 복원
+  # mutate(word = lemmatize_words(word)) %>% 
+  # id당 한 문장으로 결합
+  group_by(id, cuisine) %>% 
+  summarise(ingre = paste0(word, collapse = " ")) %>% 
+  ungroup()
+```
+
+### 데이터 나누기
+
+데이터 셋을 20/80으로 나누어야 함. 카테고리가 있어 각 카테고리별로 균등 분할함.
+
+```{r}
+set.seed(2019)
+split <- createDataPartition(cuis_pre$cuisine, p = 0.8)
+
+train <- cuis_pre[split$Resample1, ]
+test <- cuis_pre[-split$Resample1, ]
+
+train %>% 
+  group_by(cuisine) %>% 
+  summarise(n = n()) %>% 
+  mutate(per = n/sum(n)) %>% 
+  left_join(
+    test %>% 
+      group_by(cuisine) %>% 
+      summarise(n = n()) %>% 
+      mutate(per = n/sum(n)),
+    by = "cuisine"
+  ) %>% 
+  mutate(diff = per.x - per.y) %>% 
+  gt() %>% 
+  tab_options(
+    table.width = pct(100)
+  ) %>% 
+  cols_label(
+    n.x = "cuisine별 갯수",
+    per.x = "cuisine별 비율",
+    n.y = "cuisine별 갯수",
+    per.y = "cuisine별 비율",
+    diff = "비율의 차이"
+  ) %>% 
+  tab_spanner(
+    label = "Train 데이터 셋",
+    columns = vars(n.x, per.x)
+  ) %>% 
+  tab_spanner(
+    label = "Test 데이터 셋",
+    columns = vars(n.y, per.y)
+  ) %>% 
+  fmt_percent(
+    columns = vars(per.x, per.y),
+    decimals = 2
+  )
+```
+
+### text 벡터화
+
+빠르고 유의미하게 수행할 수 있는 tf-idf로 벡터화 진행
+
+```{r}
+# iterator 생성
+it_train = itoken(train$ingre, 
+                  tokenizer = word_tokenizer, 
+                  ids = train$id,
+                  progressbar = FALSE)
+
+# 단어 사전을 학습 데이터 셋에서 구축
+vocab = create_vocabulary(it_train)
+vectorizer = vocab_vectorizer(vocab)
+# dtMatrix 생성
+dtm_train = create_dtm(it_train, vectorizer)
+
+# tfidf 값 계산 적용
+tfidf = TfIdf$new()
+dtm_train_tfidf = fit_transform(dtm_train, tfidf)
+
+
+
+it_test = itoken(test$ingre, 
+                 tokenizer = word_tokenizer, 
+                 ids = test$id,
+                 progressbar = FALSE)
+
+## 기 학습한 tfidf 모델을 활용하여 벡터화
+dtm_test_tfidf <- create_dtm(it_test, vectorizer) %>%
+  transform(tfidf)
+```
+
+
+### 모델 학습
+
+다중 회귀의 10 fold cross validation 진행
+
+```{r warning=F}
+glmnet_classifier <- cv.glmnet(x = dtm_train_tfidf, 
+                              y = train[['cuisine']], 
+                              family = "multinomial",
+                              type.measure = "class",
+                              nfolds = 10,
+                              thresh = 1e-3,
+                              maxit = 1e3)
+```
+
+### 테스트 진행
+
+```{r}
+pred <- predict(object = glmnet_classifier, newx = dtm_test_tfidf, type = 'class')
+ref <- factor(test$cuisine)
+
+matric <-
+  confusionMatrix(ref, 
+                  factor(pred, levels = levels(ref)))
+matric
+```
+
